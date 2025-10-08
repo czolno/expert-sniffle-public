@@ -1,7 +1,7 @@
 import os
 import requests
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 import time
 import numpy as np
@@ -98,7 +98,7 @@ def profile(func):
 # def get_candles(...):
 #     ...
 
-OANDA_MAX_FREQ = 100 # Max 100 requests per second
+OANDA_MAX_FREQ_PER_SESSION = 100 # Max 100 requests per second
 
 def _ensure_utc(dt):
     if dt.tzinfo is None:
@@ -140,6 +140,7 @@ def _oanda_candles_request(session, instrument, granularity, current_start, end_
         params['to'] = end_dt
     try:
         response = session.get(url, headers=headers, params=params)
+        time.sleep(1.0 / OANDA_MAX_FREQ_PER_SESSION)
         status_code = response.status_code
         _log_oanda_request(instrument, granularity, price_type, current_start, end_dt, status_code, url, params)
         response.raise_for_status()
@@ -167,8 +168,9 @@ def _transform_candles(candles, price_type):
             f'{prefix}_h': np.float32(c[key]['h']),
             f'{prefix}_l': np.float32(c[key]['l']),
             f'{prefix}_c': np.float32(c[key]['c']),
-            f'{prefix}_t': np.int32(c['volume'])
         })
+        if prefix == 'm':
+            base['m_t'] = np.int32(c['volume'])  # ticks
         rows.append(base)
     if not rows:
         return None
@@ -176,36 +178,6 @@ def _transform_candles(candles, price_type):
     df['time'] = pd.to_datetime(df['time'], utc=True)
     df.set_index('time', inplace=True)
     df.sort_index(inplace=True)
-    return df
-
-def _fetch_price_type_paginated(instrument, start_dt, end_dt, granularity, price_type):
-    """Generic pagination for a single price type (M,B,A)."""
-    start_dt = _ensure_utc(start_dt); 
-    end_dt = _ensure_utc(end_dt)
-    all_parts = []
-    current_start = start_dt
-    with requests.Session() as session:
-        while True:
-            candles, status_code, error_message = _oanda_candles_request(session, instrument, granularity, current_start, end_dt, price_type=price_type, count=5000)
-            if candles is None:
-                if error_message:
-                    print(f"Error fetching {price_type} candles for {instrument}: {error_message}")
-                break
-            if not candles:
-                break
-            part = _transform_candles(candles, price_type)
-            if part is not None:
-                all_parts.append(part)
-            last_candle_time = max(c['time'] for c in candles)
-            last_candle_dt = pd.to_datetime(last_candle_time, utc=True)
-            if last_candle_dt > end_dt or len(candles) < 5000:
-                break
-            current_start = last_candle_time
-            time.sleep(1.0 / OANDA_MAX_FREQ)
-    if not all_parts:
-        return None
-    df = pd.concat(all_parts)
-    df = df[(df.index >= start_dt) & (df.index <= end_dt)]
     return df
 
 def _fetch_price_type_single(instrument, start_dt, end_dt, granularity, price_type):
@@ -219,81 +191,121 @@ def _fetch_price_type_single(instrument, start_dt, end_dt, granularity, price_ty
                 print(f"Error fetching {price_type} candles for {instrument}: {error_message}")
             return None
         df = _transform_candles(candles, price_type)
-        if df is not None:
-            df = df[(df.index >= start_dt) & (df.index <= end_dt)]
         return df
 
-def fetch_candles_and_merge_price_types(instrument, start_dt, end_dt, granularity, price_types=('M',), fetcher = _fetch_price_type_paginated):
-    """High-level fetch for one or multiple price types; returns merged DataFrame."""
-    frames = []
-    for pt in price_types:
-        f = fetcher(instrument, start_dt, end_dt, granularity, pt)
-        if f is not None:
-            frames.append(f)
-    if not frames:
-        return None
-    merged = frames[0]
-    for add in frames[1:]:
-        merged = merged.join(add, how='outer')
-    merged.sort_index(inplace=True)
-    return merged
 
-def get_candles_all_prices_during_interval(instrument, start_dt, end_dt, granularity='S5', save_path=None):
-    # First, construct the list of datetimes to fetch, in chunks of 6 hours (less than max 5000 candles at S5):
-    times = pd.date_range(start_dt, end_dt, freq='6h').append(pd.DatetimeIndex([end_dt])).unique()
-    all_dfs = []
-    for i in range(len(times)-1):
-        chunk_start = times[i]
-        chunk_end = times[i+1]
-        print(f"Fetching all prices of {instrument} [{granularity}] from {chunk_start} to {chunk_end} ...", end=' ')
-        df = fetch_candles_and_merge_price_types(instrument, chunk_start, chunk_end, granularity, price_types=('M','B','A'), fetcher=_fetch_price_type_single)
-        if df is not None:
-            all_dfs.append(df)
-            print(f"got {len(df)} rows.")
-        else:
-            print("no candles found.")
-    if not all_dfs:
-        return None
-    result = pd.concat(all_dfs)
+def fetch_interval_complete(instrument,
+                            start_dt,
+                            end_dt,
+                            granularity='S5',
+                            price_types=('M','B','A'),
+                            chunk_hours=6,
+                            save_path=None):
+    """
+    Fetch candles for multiple price types over [start_dt, end_dt] and return a
+    DataFrame whose index is the complete expected timeline for the OANDA
+    granularity, with data filled in for available timestamps and (optionally)
+    forward/other filled for missing ones.
+
+    Strategy:
+      1. Normalize times to UTC.
+      2. Derive pandas frequency from OANDA granularity.
+      3. Create the full DateTimeIndex covering [start_dt, end_dt].
+      4. Iterate over consecutive chunk_hours (default 6h) intervals; each chunk
+         is fetched with a SINGLE low-level request per price type
+         (reuses existing `_fetch_price_type_single`).
+         For S5 a 6h window => 4320 candles < 5000 limit => single request OK.
+      5. Concatenate chunk results, drop duplicate indices, sort.
+      6. Reindex onto the full index; fill missing values with 'ffill'.
+      7. Optionally persist to parquet (save_path).
+
+    Parameters
+    ----------
+    instrument : str
+    start_dt, end_dt : datetime-like
+    granularity : str (e.g. 'S5','M1','M5','M15','H1','D')
+    price_types : iterable of {'M','B','A'}
+    chunk_hours : int
+    save_path : optional parquet output path
+
+    Returns
+    -------
+    pandas.DataFrame
+    """
+    GRANULARITY_TO_FREQ = {
+        'S5': '5s', 'S10': '10s', 'S15': '15s', 'S30': '30s',
+        'M1': '1min', 'M2': '2min', 'M4': '4min', 'M5': '5min',
+        'M10': '10min','M15': '15min','M30': '30min',
+        'H1': '1H','H2':'2H','H3':'3H','H4':'4H','H6':'6H','H8':'8H','H12':'12H',
+        'D': '1D', 'W': '1W'
+    }
+    if granularity not in GRANULARITY_TO_FREQ:
+        raise ValueError(f"Unsupported granularity: {granularity}")
+
+    start_dt = _ensure_utc(pd.to_datetime(start_dt))
+    end_dt   = _ensure_utc(pd.to_datetime(end_dt))
+    if end_dt < start_dt:
+        raise ValueError("end_dt must be >= start_dt")
+
+    freq = GRANULARITY_TO_FREQ[granularity]
+
+    # Build the complete expected index (inclusive ends)
+    full_index = pd.date_range(start=start_dt, end=end_dt, freq=freq, tz=timezone.utc)
+    # Initialize result DataFrame with only index; columns will be added on demand
+    result = pd.DataFrame(index=full_index)
+
+    # Prepare chunk boundaries (6h default). We make the last edge exactly end_dt.
+    chunk_edges = pd.date_range(start=start_dt, end=end_dt, freq=f'{chunk_hours}H', tz=timezone.utc)
+    if chunk_edges[-1] != end_dt:
+        chunk_edges = chunk_edges.append(pd.DatetimeIndex([end_dt]))
+
+    for i in range(len(chunk_edges) - 1):
+        chunk_start = chunk_edges[i]
+        chunk_end   = chunk_edges[i + 1]
+        # Report the memory size of the result frame so far:
+        print(f"[fetch_interval_complete] Size already: {result.memory_usage(deep=True).sum()} Chunk {i+1}/{len(chunk_edges)-1}: {instrument} {granularity} {chunk_start} -> {chunk_end}")
+        for pt in price_types:
+            print(f"  - price type {pt}: ", end='')
+            df_pt = _fetch_price_type_single(
+                instrument,
+                chunk_start,
+                chunk_end,
+                granularity,
+                pt
+            )
+            if df_pt is None or df_pt.empty:
+                print("no data")
+                continue
+            # Assign directly into the large frame; index alignment handled by pandas.
+            # Any overlapping boundary timestamps will simply be overwritten with identical values.
+            for col in df_pt.columns:
+                if col not in result.columns:
+                    result[col] = np.nan  # create column lazily
+            result.loc[df_pt.index, df_pt.columns] = df_pt
+            print(f"{len(df_pt)} rows")
+
+    result = result.ffill()
+
+    # Trim leading rows with any NaNs using a faster heuristic: take the max of
+    # each column's first valid index (earliest row where that column has data).
+    # This avoids computing an all-columns row mask across the entire frame up front.
+    if not result.empty and result.shape[1] > 0:
+        first_valid = max([result[col].first_valid_index() for col in result.columns])
+        result = result.loc[first_valid:]
+
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         result.to_parquet(save_path)
+        print(f"[fetch_interval_complete] Saved to {save_path}")
+
     return result
 
-def get_candles_all_prices_year_by_year(instrument, start_date='2005-01-01', end_date=None, granularity='S5', save_dir=None):
-    start_dt = _ensure_utc(datetime.strptime(start_date, '%Y-%m-%d'))
-    end_dt = _ensure_utc(datetime.strptime(end_date, '%Y-%m-%d')) if end_date else datetime.now(timezone.utc)
-    if save_dir: os.makedirs(save_dir, exist_ok=True)
-    for year in range(start_dt.year, end_dt.year + 1):
-        year_start = datetime(year, 1, 1, tzinfo=timezone.utc)
-        year_end = datetime(year, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
-        fetch_start = max(start_dt, year_start)
-        fetch_end = min(end_dt, year_end)
-        df = fetch_candles_and_merge_price_types(instrument, fetch_start, fetch_end, granularity, price_types=('M','B','A'))
-        if df is not None:
-            fname = _parquet_filename(instrument, year, granularity + '_BA', save_dir)
-            df.to_parquet(fname)
-    return
+if __name__ == "__main__":
+    # Example usage:
+    fetch_interval_complete('EUR_CHF', 
+                            '2009-01-01', 
+                            '2015-12-31', 
+                            granularity='S5', 
+                            price_types=('M','B','A'), 
+                            save_path='data/examples/EUR_CHF_20090101_20151231_5S.parquet')
 
-def check_missing_data(input_dir):
-    # For each time interval between the end of the current file and the beginning of the next file, try to download the missing data.
-    parquet_files = sorted([f for f in os.listdir(input_dir) if f.endswith('.parquet')])
-    instrument = 'EUR_CHF'
-    for i in range(len(parquet_files) - 1):
-        current_file = parquet_files[i]
-        next_file = parquet_files[i + 1]
-        current_df = pd.read_parquet(os.path.join(input_dir, current_file))
-        next_df = pd.read_parquet(os.path.join(input_dir, next_file))
-        # End of the index:
-        current_end_time = current_df.index.to_series().iloc[-1]
-        next_start_time = next_df.index.to_series().iloc[0]
-        if (next_start_time - current_end_time).total_seconds() > 5:
-            print(f'Missing data between {current_end_time} and {next_start_time}. Attempting to fetch...')
-            # Fetch the missing data:
-            missing = get_candles_all_prices_during_interval(instrument, current_end_time, next_start_time)
-            if missing is not None:
-                print(f'Successfully fetched missing data for interval {current_end_time} to {next_start_time}. Saving to parquet.')
-                # Format the times as "YYYYMMDDHHMMSS":
-                t0 = current_end_time.strftime('%Y%m%d%H%M%S')
-                t1 = next_start_time.strftime('%Y%m%d%H%M%S')
-                missing.to_parquet(os.path.join(input_dir, f'missing_{t0}_{t1}.parquet'))

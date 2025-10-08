@@ -105,7 +105,8 @@ def calculate_core_features(df):
     return df
 
 def add_future_shifted_feature(df, col, new_col, freq='5min'):
-    df[new_col] = df[col].shift(freq=freq)
+    # shift in opposite direction (lead by one `freq` interval)
+    df[new_col] = df[col].shift(periods=-1, freq=freq)
     return df
 
 # def process_parquet_file(input_file, output_file):
@@ -173,6 +174,6 @@ def merge_and_process_all(input_dir='data/raw', output_dir='data/processed',
     df.to_parquet(processed_path)
     print(f"Processed merged data written to {processed_path}")
 
-if __name__ == "__main__":
-    # When run directly, merge raw -> process -> produce single processed parquet
-    merge_and_process_all(input_dir='data/raw', output_dir='data/processed')
+# if __name__ == "__main__":
+#     # When run directly, merge raw -> process -> produce single processed parquet
+#     merge_and_process_all(input_dir='data/raw', output_dir='data/processed')

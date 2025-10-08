@@ -1,3 +1,7 @@
+# Hide secrets:
+# .env file with API keys
+.env
+
 # Ignore data directory
 data/
 
