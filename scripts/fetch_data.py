@@ -5,6 +5,18 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 import time
 import numpy as np
+try:
+    from tqdm import tqdm
+except ImportError:  # optional dependency
+    tqdm = None
+
+def _format_bytes(num: int) -> str:
+    """Return human-readable memory size for a number of bytes."""
+    for unit in ['B','KB','MB','GB','TB']:
+        if num < 1024.0:
+            return f"{num:3.1f} {unit}"
+        num /= 1024.0
+    return f"{num:.1f} PB"
 
 # Load environment variables from .env file
 load_dotenv()
@@ -200,7 +212,10 @@ def fetch_interval_complete(instrument,
                             granularity='S5',
                             price_types=('M','B','A'),
                             chunk_hours=6,
-                            save_path=None):
+                            save_path=None,
+                            use_tqdm=True,
+                            show_eta=True,
+                            eta_smoothing=0.3):
     """
     Fetch candles for multiple price types over [start_dt, end_dt] and return a
     DataFrame whose index is the complete expected timeline for the OANDA
@@ -227,6 +242,12 @@ def fetch_interval_complete(instrument,
     price_types : iterable of {'M','B','A'}
     chunk_hours : int
     save_path : optional parquet output path
+    use_tqdm : bool, default True
+        If True and tqdm is installed, show a dynamic progress bar instead of static prints per chunk.
+    show_eta : bool, default True
+        If True, prints an ETA after each chunk using exponential moving average of chunk durations.
+    eta_smoothing : float, default 0.3
+        Smoothing factor (0<alpha<=1) for EMA of chunk durations when estimating ETA.
 
     Returns
     -------
@@ -259,30 +280,65 @@ def fetch_interval_complete(instrument,
     if chunk_edges[-1] != end_dt:
         chunk_edges = chunk_edges.append(pd.DatetimeIndex([end_dt]))
 
-    for i in range(len(chunk_edges) - 1):
+    total_chunks = len(chunk_edges) - 1
+    ema_chunk_seconds = None
+    overall_start_time = time.time()
+
+    iterator = range(total_chunks)
+    use_bar = use_tqdm and (tqdm is not None)
+    if use_bar:
+        iterator = tqdm(iterator, total=total_chunks, desc=f"{instrument} {granularity} chunks", unit="chunk")
+
+    def _fmt(sec):
+        if sec < 60:
+            return f"{sec:0.1f}s"
+        m, s = divmod(int(sec), 60)
+        if m < 60:
+            return f"{m}m{s:02d}s"
+        h, m = divmod(m, 60)
+        return f"{h}h{m:02d}m{s:02d}s"
+
+    for i in iterator:
         chunk_start = chunk_edges[i]
         chunk_end   = chunk_edges[i + 1]
-        # Report the memory size of the result frame so far:
-        print(f"[fetch_interval_complete] Size already: {result.memory_usage(deep=True).sum()} Chunk {i+1}/{len(chunk_edges)-1}: {instrument} {granularity} {chunk_start} -> {chunk_end}")
+        iter_start_time = time.time()
+        mem_bytes = result.memory_usage(deep=True).sum()
+        mem_hr = _format_bytes(mem_bytes)
+        if not use_bar:
+            print(f"[fetch_interval_complete] Mem={mem_hr} | Chunk {i+1}/{total_chunks}: {instrument} {granularity} {chunk_start} -> {chunk_end}")
         for pt in price_types:
-            print(f"  - price type {pt}: ", end='')
-            df_pt = _fetch_price_type_single(
-                instrument,
-                chunk_start,
-                chunk_end,
-                granularity,
-                pt
-            )
+            df_pt = _fetch_price_type_single(instrument, chunk_start, chunk_end, granularity, pt)
             if df_pt is None or df_pt.empty:
-                print("no data")
+                if not use_bar:
+                    print(f"  - {pt}: no data")
                 continue
-            # Assign directly into the large frame; index alignment handled by pandas.
-            # Any overlapping boundary timestamps will simply be overwritten with identical values.
             for col in df_pt.columns:
                 if col not in result.columns:
-                    result[col] = np.nan  # create column lazily
+                    result[col] = np.nan
             result.loc[df_pt.index, df_pt.columns] = df_pt
-            print(f"{len(df_pt)} rows")
+            if not use_bar:
+                print(f"  - {pt}: {len(df_pt)} rows")
+        # ETA
+        if show_eta:
+            elapsed_chunk = time.time() - iter_start_time
+            if ema_chunk_seconds is None:
+                ema_chunk_seconds = elapsed_chunk
+            else:
+                ema_chunk_seconds = eta_smoothing * elapsed_chunk + (1 - eta_smoothing) * ema_chunk_seconds
+            chunks_left = total_chunks - (i + 1)
+            eta_seconds = ema_chunk_seconds * chunks_left
+            total_elapsed = time.time() - overall_start_time
+            if use_bar:
+                iterator.set_postfix({
+                    'mem': mem_hr,
+                    'last': f"{elapsed_chunk:0.2f}s",
+                    'avg': f"{ema_chunk_seconds:0.2f}s",
+                    'eta': _fmt(eta_seconds),
+                    'elapsed': _fmt(total_elapsed)
+                })
+            else:
+                pct = (i + 1) / total_chunks * 100
+                print(f"    -> Progress: {pct:5.1f}% | Mem {mem_hr} | Last {elapsed_chunk:0.2f}s | Avg {ema_chunk_seconds:0.2f}s | ETA {_fmt(eta_seconds)} | Elapsed {_fmt(total_elapsed)}")
 
     result = result.ffill()
 
