@@ -2,11 +2,7 @@
 import os
 import pandas as pd
 
-data_output_directory = '../data/processed'
-
-vol_target = 'm_realized_vol_5min_future'
-
-def get_split_paths():
+def get_split_paths(data_output_directory):
     """
     If the dataset was split by [scripts/split_dataset.py](scripts/split_dataset.py),
     return the three file paths. Otherwise return None.
@@ -18,35 +14,13 @@ def get_split_paths():
         return {'train': train_path, 'val': val_path, 'test': test_path}
     return None
 
-def clean_labels(X, y):
-    # Ensure no NaNs in labels
-    na = y.index[y.isna()]
-    if (len(na) < 400):
-        print("Warning: Found NaNs in y, interpolating.")
-        y = y.interpolate()
-        na = y.index[y.isna()]
-        if len(na) > 0:
-            X = X.drop(index=na)
-            y = y.drop(index=na)
-            print(f"Dropped {len(na)} rows with NaN after interpolation.")
-    else:
-        raise ValueError("Too many NaNs in y, please check the preprocessing.")
-    return X, y
-
-def get_data(part='train'):
+def get_data(data_output_directory, part, target):
     """
     Load the specified data split ('train', 'val', 'test') into a single DataFrame.
     """
-    paths = get_split_paths()
-    if paths is None:
-        raise FileNotFoundError("Data splits not found. Please run the data preparation scripts first.")
-    if part not in paths:
-        raise ValueError(f"Invalid part specified: {part}. Choose from 'train', 'val', 'test'.")
-    
+    paths = get_split_paths(data_output_directory)
     df = pd.read_parquet(paths[part])
-    X = df.drop(columns=[vol_target])
-    y = df[vol_target]
-
-    X, y = clean_labels(X, y)
+    X = df.drop(columns=[target])
+    y = df[target]
 
     return X, y

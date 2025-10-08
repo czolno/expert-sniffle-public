@@ -117,12 +117,6 @@ def _ensure_utc(dt):
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
-def _parquet_filename(instrument, year, granularity, save_dir=None):
-    fname = f"{instrument}_{year}{'_' + granularity if granularity != 'D' else ''}.parquet"
-    if save_dir:
-        fname = os.path.join(save_dir, fname)
-    return fname
-
 def _log_oanda_request(instrument, granularity, price_type, from_time, to_time, status_code, url, params):
     import datetime
     log_path = "oanda_requests.log"
@@ -340,6 +334,10 @@ def fetch_interval_complete(instrument,
                 pct = (i + 1) / total_chunks * 100
                 print(f"    -> Progress: {pct:5.1f}% | Mem {mem_hr} | Last {elapsed_chunk:0.2f}s | Avg {ema_chunk_seconds:0.2f}s | ETA {_fmt(eta_seconds)} | Elapsed {_fmt(total_elapsed)}")
 
+    # Careful: the number of ticks per time bucket is zero if no trades occurred.
+    result['m_t'] = result['m_t'].fillna(0)  # Fill missing tick counts with 0
+
+    # Forward fill prices, only after the tick count fill.
     result = result.ffill()
 
     # Trim leading rows with any NaNs using a faster heuristic: take the max of
@@ -355,13 +353,4 @@ def fetch_interval_complete(instrument,
         print(f"[fetch_interval_complete] Saved to {save_path}")
 
     return result
-
-if __name__ == "__main__":
-    # Example usage:
-    fetch_interval_complete('EUR_CHF', 
-                            '2009-01-01', 
-                            '2015-12-31', 
-                            granularity='S5', 
-                            price_types=('M','B','A'), 
-                            save_path='data/examples/EUR_CHF_20090101_20151231_5S.parquet')
 
