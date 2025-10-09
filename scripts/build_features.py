@@ -89,10 +89,10 @@ def add_future_shifted_feature(df, col, new_col, freq='5min'):
     df = df.loc[:last_valid_index]
     return df
 
-def build_features(input_file, output_file):
+def build_features(input_file, output_file, source_col_name, target_col_name, shift_freq='5min'):
     df = pd.read_parquet(input_file)
     # df = drop_unused_columns(df)
     df = calculate_core_features(df)
-    df = add_future_shifted_feature(df, 'm_realized_vol_5min', 'm_realized_vol_5min_future', freq='5min')
+    df = add_future_shifted_feature(df, source_col_name, target_col_name, freq=shift_freq)
     df.to_parquet(output_file)
 

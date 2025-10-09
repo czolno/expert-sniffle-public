@@ -7,7 +7,10 @@ import pandas as pd
 def _make_writer(path, schema):
     return pq.ParquetWriter(path, schema)
 
-def split_processed_parquet(processed_path, out_dir, train_cutoff, val_cutoff):
+def split_processed_parquet(processed_path, out_dir, 
+                            train_start,
+                            train_cutoff, 
+                            val_cutoff):
     if not os.path.exists(out_dir):
         os.makedirs(out_dir)
     train_path = os.path.join(out_dir, 'train.parquet')
@@ -25,7 +28,7 @@ def split_processed_parquet(processed_path, out_dir, train_cutoff, val_cutoff):
             df = table.to_pandas()
 
             # Partition by time windows
-            df_train = df[df.index < train_cutoff]
+            df_train = df[(df.index >= train_start) & (df.index < train_cutoff)]
             df_val   = df[(df.index >= train_cutoff) & (df.index < val_cutoff)]
             df_test  = df[df.index >= val_cutoff]
 
